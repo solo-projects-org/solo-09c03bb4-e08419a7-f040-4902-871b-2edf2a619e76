@@ -54,6 +54,7 @@ docker compose up --build
 | `POST /images` | 流式上传（随机编号）；`X-Idempotency-Token` 幂等；`X-Filename` 可选 |
 | `PUT /images/{image_id}` | 按调用方编号上传 |
 | `GET /images/{image_id}` | 按号下载，流式解密、逐帧 GCM 验签、SHA-256 校验 |
+| `POST /images/{image_id}/export` | 导出加密交接包（MSXP）：密文原样装包 + 一次性协商密钥封装 DEK |
 | `GET /images/{image_id}/meta` | 元数据/状态（不返回信封密文） |
 | `GET /images` | 列表 |
 | `POST /rotations` | 发起主密钥轮换（body `{"confirm": true}`），返回 202 + job_id |
@@ -80,6 +81,50 @@ JOB=$(curl -sS -X POST -H 'Content-Type: application/json' \
   -d '{"confirm":true}' http://localhost:8000/rotations | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
 watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 ```
+
+## 加密交接包导出（合作方独立复核）
+
+向无法连接本库的合作方交接已入仓原片时，按编号导出 **MSXP 交接包**：
+原片密文**逐字节原样**装包（不重加密、不解密、明文不落盘），该件 DEK 用
+"一次性临时 X25519 密钥对 + 对方公钥"协商出的密钥封装。接收方凭自己的
+私钥即可独立解包、逐帧验签、核对摘要，**无需本库主密钥、无需密钥服务在线**。
+
+```bash
+# 1) 合作方生成 X25519 密钥对，把公钥（hex/base64）交给实验室
+python3 - <<'EOF'
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+k = X25519PrivateKey.generate()
+open("recipient.sk","w").write(k.private_bytes_raw().hex())      # 私钥自留
+print("公钥:", k.public_key().public_bytes_raw().hex())           # 交给对方
+EOF
+
+# 2) 实验室按编号导出交接包
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"recipient_public_key": "<对方公钥hex>"}' \
+  http://localhost:8000/images/slide-001/export -o slide-001.msxp
+
+# 3) 接收方独立解包（只依赖 cryptography；全部校验通过才产出明文）
+python3 tools/msxp_unpack.py --key recipient.sk \
+  --package slide-001.msxp --out slide-001.czi
+```
+
+包布局：`MSXP magic(4) | version(1) | header_len(4) | header(JSON) | 密文`。
+header 含原片编号、密文长度 `enc_size`、明文 `sha256`、一次性临时公钥与
+DEK 信封（X25519+HKDF-SHA256+AES-256-GCM，AAD 绑定编号）；密文即仓内
+`.msef` 分帧密文，逐帧 GCM 验签、以结束帧收尾。
+
+**完整性语义（防止误认完整）**
+
+| 故障 | 表现 |
+|---|---|
+| 密钥服务不可用/解包被拒 | 响应流开始前即 503/410，接收方拿不到任何包字节 |
+| 密文缺失或尺寸与元数据不符 | 410/500，不交付 |
+| 传输中断/包被截断 | Content-Length 短缺 + 包内缺结束帧，解包工具判定不完整 |
+| 包被篡改/私钥错误 | GCM 验签或摘要核对失败，工具删除部分输出并非零退出 |
+
+轮换改包与导出交错时，DEK 始终对应同一份密文（轮换只换信封、不动密文
+正文）；若导出快照恰好落在"旧 MK 已销毁、行已改绑新 MK"的窗口，服务端
+按新快照自动重试一次解包，仍失败则如实报错，绝不交付可疑包。
 
 ## 轮换语义（需求对照）
 
@@ -114,7 +159,7 @@ KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（35 项，含离线加密单测）
 python -m pytest tests/ -q
 ```
 
@@ -123,7 +168,8 @@ python -m pytest tests/ -q
 篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读）、
 进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
 双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
-跨越轮换的上传自动改绑。
+跨越轮换的上传自动改绑、交接包导出（独立解包往返/包内无明文/错钥与篡改
+与截断拒绝/轮换交错 DEK 对应/密钥服务不可用与密文缺失不交付/导出零落盘）。
 
 ## 限制与生产化建议（见 docs/ 下说明）
 

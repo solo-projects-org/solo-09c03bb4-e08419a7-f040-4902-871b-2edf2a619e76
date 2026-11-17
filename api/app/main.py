@@ -32,6 +32,12 @@ from starlette.formparsers import MultiPartParser
 MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
+from .export_package import (
+    ExportPackageError,
+    build_header,
+    package_prefix,
+    parse_recipient_public_key,
+)
 from .keyclient import KeyClient, KeyServiceError
 from .metadata import MetadataDB
 from .rotation import RotationWorker
@@ -328,6 +334,106 @@ async def image_meta(image_id: str):
         raise HTTPException(404, detail="image not found")
     meta.pop("wrapped_dek", None)
     return meta
+
+
+# --------------------------------------------------------------------------
+# 加密交接包导出（合作方独立复核）
+# --------------------------------------------------------------------------
+class ExportRequest(BaseModel):
+    recipient_public_key: str
+
+
+async def _unwrap_dek_for_export(image_id: str, meta: dict) -> bytes:
+    """按元数据快照解包 DEK；与轮换改包交错时按新快照重试一次。
+
+    竞态窗口：导出读到旧 MK 信封 -> 轮换 rewrap 该行 -> 旧 MK 被销毁 ->
+    unwrap 收到 410。此时重读元数据：若行已改绑新 MK，用新信封再解一次
+    （DEK 不变，仍对应同一份密文）；行未变化则如实失败，绝不交付可疑包。
+    """
+    try:
+        return await keys.unwrap(meta["master_key_id"], meta["wrapped_dek"])
+    except KeyServiceError as exc:
+        if exc.status_code != 410:
+            raise
+        fresh = db.get_image(image_id)
+        if (fresh and fresh["status"] == "ready"
+                and (fresh["master_key_id"], fresh["wrapped_dek"])
+                != (meta["master_key_id"], meta["wrapped_dek"])):
+            return await keys.unwrap(fresh["master_key_id"],
+                                     fresh["wrapped_dek"])
+        raise
+
+
+@app.post("/images/{image_id}/export",
+          summary="导出加密交接包（密文原样装包 + 一次性协商密钥封装 DEK）")
+async def export_image(image_id: str, body: ExportRequest):
+    """生成 MSXP 交接包：对方凭 X25519 私钥即可独立解包复核，无需本库主密钥。
+
+    失败语义（全部发生在响应流开始之前，接收方不会拿到"半个 200 包"）：
+      * 密钥服务不可达/解包被拒 -> 503/410/400，无任何包字节流出；
+      * 密文 blob 缺失或与元数据尺寸不符 -> 410/500；
+      * 传输中断 -> Content-Length 短缺 + 包内缺结束帧，接收方判定不完整。
+    """
+    meta = db.get_image(image_id)
+    if meta is None:
+        raise HTTPException(404, detail="image not found")
+    if meta["status"] != "ready":
+        raise HTTPException(409, detail=f"image is {meta['status']}")
+    blob_path = meta["blob_path"]
+    if not os.path.exists(blob_path):
+        raise HTTPException(410, detail="encrypted blob missing on storage")
+    # 装包前核对：磁盘密文尺寸必须与元数据一致，否则宁可失败也不交付
+    actual_size = os.path.getsize(blob_path)
+    if meta["enc_size"] is None or actual_size != meta["enc_size"]:
+        raise HTTPException(
+            500, detail={"code": "ciphertext_size_mismatch",
+                         "message": f"blob size {actual_size} != metadata "
+                                    f"enc_size {meta['enc_size']}"})
+    try:
+        recipient_pub = parse_recipient_public_key(body.recipient_public_key)
+    except ExportPackageError as exc:
+        raise HTTPException(400, detail=str(exc))
+    try:
+        dek = await _unwrap_dek_for_export(image_id, meta)
+    except KeyServiceError as exc:
+        raise _key_error(exc)
+    try:
+        header_bytes = build_header(image_id, meta["enc_size"],
+                                    meta["sha256"] or "", recipient_pub, dek)
+    finally:
+        del dek  # 明文 DEK 仅存于本请求内存，封装完成即丢弃引用
+    prefix = package_prefix(header_bytes)
+    total_len = len(prefix) + meta["enc_size"]
+
+    async def package_iter():
+        yield prefix
+        sent = 0
+        loop = asyncio.get_running_loop()
+        f = await loop.run_in_executor(None, open, blob_path, "rb")
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, f.read, 1024 * 1024)
+                if not chunk:
+                    break
+                sent += len(chunk)
+                yield chunk
+        finally:
+            await loop.run_in_executor(None, f.close)
+        if sent != meta["enc_size"]:
+            # 密文流中途被截断/改动：不补零、不伪装完整；提前结束响应使
+            # 实际字节数少于 Content-Length，接收方据此判定包不完整。
+            print(f"[export] blob short-read for {image_id}: "
+                  f"{sent} != {meta['enc_size']}; aborting package stream")
+
+    return StreamingResponse(
+        package_iter(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(total_len),
+            "Content-Disposition": f'attachment; filename="{image_id}.msxp"',
+            "X-Image-Id": image_id,
+            "X-SHA256": meta["sha256"] or "",
+        })
 
 
 # --------------------------------------------------------------------------
